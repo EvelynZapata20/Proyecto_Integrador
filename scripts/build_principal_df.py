@@ -792,98 +792,131 @@ def build_pos_cash_features(pos_cash_balance: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# credit_card_balance: features por SK_ID_CURR
+# credit_card_balance: limpieza y agregación por SK_ID_CURR
 # =============================================================================
+
+def clean_credit_card_balance(cc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Limpieza de credit_card_balance según eda_credit_card_balance.ipynb:
+    - Elimina columnas redundantes de receivable.
+    - Elimina filas con montos negativos en variables monetarias clave.
+    - Imputa con 0 columnas de pagos/drawings/cuotas con nulos estructurales.
+    """
+    cc = cc.copy()
+
+    cc = cc.drop(columns=["AMT_RECIVABLE", "AMT_RECEIVABLE_PRINCIPAL"], errors="ignore")
+
+    cols_negativas = [
+        "AMT_BALANCE",
+        "AMT_DRAWINGS_ATM_CURRENT",
+        "AMT_DRAWINGS_CURRENT",
+        "AMT_TOTAL_RECEIVABLE",
+    ]
+    cols_negativas_present = [c for c in cols_negativas if c in cc.columns]
+    if cols_negativas_present:
+        mask_negativos = cc[cols_negativas_present].lt(0).any(axis=1)
+        cc = cc.loc[~mask_negativos].copy()
+
+    cols_imputar_0 = [
+        "AMT_PAYMENT_CURRENT",
+        "AMT_DRAWINGS_ATM_CURRENT",
+        "AMT_DRAWINGS_OTHER_CURRENT",
+        "AMT_DRAWINGS_POS_CURRENT",
+        "CNT_DRAWINGS_ATM_CURRENT",
+        "CNT_DRAWINGS_OTHER_CURRENT",
+        "CNT_DRAWINGS_POS_CURRENT",
+        "AMT_INST_MIN_REGULARITY",
+        "CNT_INSTALMENT_MATURE_CUM",
+    ]
+    for col in cols_imputar_0:
+        if col in cc.columns:
+            cc[col] = cc[col].fillna(0)
+
+    return cc
+
 
 def build_credit_card_features(credit_card_balance: pd.DataFrame) -> pd.DataFrame:
     """
-    Features de credit_card_balance.
-
-    En el notebook se identificó que AMT_RECEIVABLE_PRINCIPAL y AMT_RECIVABLE
-    eran redundantes frente a AMT_TOTAL_RECEIVABLE, por eso se eliminan.
-    Como el notebook no tenía una función final de features, se agregan variables
-    consistentes con el EDA: estados, mora, balances, pagos, límite y utilización.
+    Features de credit_card_balance agregadas por SK_ID_CURR.
+    Replica eda_credit_card_balance.ipynb (cc_agg).
     """
-    cc = credit_card_balance.copy()
+    cc = clean_credit_card_balance(credit_card_balance)
     id_col = "SK_ID_CURR"
-    prev_id_col = "SK_ID_PREV"
     status_col = "NAME_CONTRACT_STATUS"
-
-    cc = cc.drop(columns=["AMT_RECEIVABLE_PRINCIPAL", "AMT_RECIVABLE"], errors="ignore")
 
     cc["cc_is_active"] = cc[status_col].eq("Active").astype(int)
     cc["cc_is_completed"] = cc[status_col].eq("Completed").astype(int)
+    cc["cc_is_demand"] = cc[status_col].eq("Demand").astype(int)
     cc["cc_has_dpd"] = cc["SK_DPD"].gt(0).astype(int)
     cc["cc_has_dpd_def"] = cc["SK_DPD_DEF"].gt(0).astype(int)
+    cc["cc_has_drawings"] = cc["AMT_DRAWINGS_CURRENT"].gt(0).astype(int)
 
     if {"AMT_BALANCE", "AMT_CREDIT_LIMIT_ACTUAL"}.issubset(cc.columns):
-        cc["cc_utilization"] = safe_div(cc["AMT_BALANCE"], cc["AMT_CREDIT_LIMIT_ACTUAL"])
+        cc["cc_utilization"] = np.where(
+            cc["AMT_CREDIT_LIMIT_ACTUAL"].gt(0),
+            cc["AMT_BALANCE"] / cc["AMT_CREDIT_LIMIT_ACTUAL"],
+            0,
+        )
     else:
-        cc["cc_utilization"] = np.nan
+        cc["cc_utilization"] = 0.0
 
-    if {"AMT_PAYMENT_CURRENT", "AMT_INST_MIN_REGULARITY"}.issubset(cc.columns):
-        cc["cc_payment_min_ratio"] = safe_div(cc["AMT_PAYMENT_CURRENT"], cc["AMT_INST_MIN_REGULARITY"])
-    else:
-        cc["cc_payment_min_ratio"] = np.nan
-
-    agg_dict = {
-        "cc_months_count": ("MONTHS_BALANCE", "count"),
-        "cc_prev_credit_count": (prev_id_col, "nunique"),
-        "cc_active_rate": ("cc_is_active", "mean"),
-        "cc_completed_rate": ("cc_is_completed", "mean"),
-        "cc_dpd_positive_rate": ("cc_has_dpd", "mean"),
-        "cc_dpd_def_positive_rate": ("cc_has_dpd_def", "mean"),
-        "cc_dpd_max": ("SK_DPD", "max"),
-        "cc_dpd_def_max": ("SK_DPD_DEF", "max"),
-        "cc_utilization_mean": ("cc_utilization", "mean"),
-        "cc_utilization_max": ("cc_utilization", "max"),
-        "cc_payment_min_ratio_mean": ("cc_payment_min_ratio", "mean"),
-    }
-
-    optional_aggs = {
-        "AMT_BALANCE": [("cc_amt_balance_mean", "mean"), ("cc_amt_balance_max", "max")],
-        "AMT_CREDIT_LIMIT_ACTUAL": [("cc_credit_limit_mean", "mean"), ("cc_credit_limit_max", "max")],
-        "AMT_TOTAL_RECEIVABLE": [("cc_total_receivable_mean", "mean"), ("cc_total_receivable_max", "max")],
-        "AMT_DRAWINGS_CURRENT": [("cc_drawings_current_mean", "mean"), ("cc_drawings_current_max", "max")],
-        "AMT_DRAWINGS_ATM_CURRENT": [("cc_drawings_atm_current_mean", "mean")],
-        "AMT_DRAWINGS_POS_CURRENT": [("cc_drawings_pos_current_mean", "mean")],
-        "AMT_PAYMENT_CURRENT": [("cc_payment_current_mean", "mean"), ("cc_payment_current_max", "max")],
-        "AMT_INST_MIN_REGULARITY": [("cc_min_payment_mean", "mean")],
-        "CNT_INSTALMENT_MATURE_CUM": [("cc_installments_mature_cum_max", "max")],
-    }
-
-    for source_col, named_aggs in optional_aggs.items():
-        if source_col in cc.columns:
-            for output_col, func in named_aggs:
-                agg_dict[output_col] = (source_col, func)
-
-    features = cc.groupby(id_col).agg(**agg_dict)
-
-    # Snapshot más reciente por crédito previo.
-    if {"MONTHS_BALANCE", id_col, prev_id_col}.issubset(cc.columns):
-        recent_idx = cc.groupby([id_col, prev_id_col])["MONTHS_BALANCE"].idxmax()
-        recent = cc.loc[recent_idx].copy()
-
-        recent_aggs = {
-            "cc_recent_active_count": ("cc_is_active", "sum"),
-            "cc_recent_utilization_mean": ("cc_utilization", "mean"),
-            "cc_recent_utilization_max": ("cc_utilization", "max"),
-        }
-        if "AMT_BALANCE" in recent.columns:
-            recent_aggs["cc_recent_balance_mean"] = ("AMT_BALANCE", "mean")
-        if "AMT_CREDIT_LIMIT_ACTUAL" in recent.columns:
-            recent_aggs["cc_recent_credit_limit_mean"] = ("AMT_CREDIT_LIMIT_ACTUAL", "mean")
-
-        recent_features = recent.groupby(id_col).agg(**recent_aggs)
-        features = features.join(recent_features)
-
-    features = (
-        features
-        .replace([np.inf, -np.inf], np.nan)
+    cc["cc_utilization"] = (
+        cc["cc_utilization"]
+        .replace([np.inf, -np.inf], 0)
         .fillna(0)
-        .reset_index()
     )
 
+    if {"AMT_PAYMENT_CURRENT", "AMT_INST_MIN_REGULARITY"}.issubset(cc.columns):
+        cc["cc_payment_min_ratio"] = np.where(
+            cc["AMT_INST_MIN_REGULARITY"].gt(0),
+            cc["AMT_PAYMENT_CURRENT"] / cc["AMT_INST_MIN_REGULARITY"],
+            0,
+        )
+    else:
+        cc["cc_payment_min_ratio"] = 0.0
+
+    cc["cc_payment_min_ratio"] = (
+        cc["cc_payment_min_ratio"]
+        .replace([np.inf, -np.inf], 0)
+        .fillna(0)
+    )
+
+    grupo = cc.groupby(id_col)
+
+    features = pd.DataFrame(
+        {
+            "cc_months_count": grupo["MONTHS_BALANCE"].count(),
+            "cc_cards_count": grupo["SK_ID_PREV"].nunique(),
+            "cc_active_rate": grupo["cc_is_active"].mean(),
+            "cc_completed_rate": grupo["cc_is_completed"].mean(),
+            "cc_demand_rate": grupo["cc_is_demand"].mean(),
+            "cc_dpd_positive_rate": grupo["cc_has_dpd"].mean(),
+            "cc_dpd_def_positive_rate": grupo["cc_has_dpd_def"].mean(),
+            "cc_dpd_max": grupo["SK_DPD"].max(),
+            "cc_dpd_def_max": grupo["SK_DPD_DEF"].max(),
+            "cc_amt_balance_mean": grupo["AMT_BALANCE"].mean(),
+            "cc_amt_balance_max": grupo["AMT_BALANCE"].max(),
+            "cc_credit_limit_mean": grupo["AMT_CREDIT_LIMIT_ACTUAL"].mean(),
+            "cc_credit_limit_max": grupo["AMT_CREDIT_LIMIT_ACTUAL"].max(),
+            "cc_total_receivable_mean": grupo["AMT_TOTAL_RECEIVABLE"].mean(),
+            "cc_total_receivable_max": grupo["AMT_TOTAL_RECEIVABLE"].max(),
+            "cc_utilization_mean": grupo["cc_utilization"].mean(),
+            "cc_utilization_max": grupo["cc_utilization"].max(),
+            "cc_payment_current_mean": grupo["AMT_PAYMENT_CURRENT"].mean(),
+            "cc_payment_current_max": grupo["AMT_PAYMENT_CURRENT"].max(),
+            "cc_payment_total_mean": grupo["AMT_PAYMENT_TOTAL_CURRENT"].mean(),
+            "cc_payment_total_sum": grupo["AMT_PAYMENT_TOTAL_CURRENT"].sum(),
+            "cc_payment_min_ratio_mean": grupo["cc_payment_min_ratio"].mean(),
+            "cc_drawings_current_mean": grupo["AMT_DRAWINGS_CURRENT"].mean(),
+            "cc_drawings_current_max": grupo["AMT_DRAWINGS_CURRENT"].max(),
+            "cc_drawings_atm_current_mean": grupo["AMT_DRAWINGS_ATM_CURRENT"].mean(),
+            "cc_drawings_pos_current_mean": grupo["AMT_DRAWINGS_POS_CURRENT"].mean(),
+            "cc_drawings_positive_rate": grupo["cc_has_drawings"].mean(),
+            "cc_installments_mature_cum_max": grupo["CNT_INSTALMENT_MATURE_CUM"].max(),
+        }
+    ).reset_index()
+
+    features = features.replace([np.inf, -np.inf], np.nan).fillna(0)
     return features
 
 
