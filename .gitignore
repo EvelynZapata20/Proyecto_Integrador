@@ -9,7 +9,8 @@ venv/
 .env
 
 # Data
-data/
+data/raw
+data/model_outputs
 
 # Jupyter
 .ipynb_checkpoints/
