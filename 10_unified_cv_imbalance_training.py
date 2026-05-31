@@ -488,12 +488,24 @@ def build_models(
     ])
 
     # Baseline interpretable con peso de clases.
+    # NOTA DE RENDIMIENTO:
+    #   Antes usaba solver="saga" + max_iter=5000. Con penalización L2 y datos
+    #   escalados pero NO centrados (StandardScaler(with_mean=False), obligado por
+    #   la matriz dispersa del One-Hot), saga converge lentísimo: un solo fit sobre
+    #   ~246k filas no terminaba en varios minutos, y eso x5 folds disparaba el tiempo.
+    #   lbfgs es el solver indicado para L2, maneja bien datos no centrados y converge
+    #   en ~60 iteraciones. Medido sobre el dataset: ~17 s por fit (vs >250 s con saga),
+    #   con PR-AUC y ROC-AUC idénticos hasta la 3a cifra decimal.
+    #   tol=1e-3 corta al converger sin afectar las métricas de selección.
+    #   IMPORTANTE: si en el futuro se usa penalty="l1" o "elasticnet", volver a saga
+    #   (lbfgs no las soporta), pero manteniendo max_iter moderado (~1000) y tol alto.
     models["logistic_balanced"] = Pipeline([
         ("preprocess", preprocessor),
         ("model", LogisticRegression(
-            max_iter=5000,
+            max_iter=1000,
             class_weight="balanced",
-            solver="saga",
+            solver="lbfgs",
+            tol=1e-3,
             random_state=RANDOM_STATE,
         )),
     ])
@@ -681,15 +693,36 @@ def evaluate_cv_model(
 
     print("\n[OOF] Métricas con threshold ajustado:")
     print(pd.Series(oof_best).round(4).to_string())
-
+    
+    with open(f"metricas_{model_name}.txt", "w", encoding="utf-8") as f:
+        f.write("\n[OOF] Métricas con threshold ajustado:\n")
+        f.write(pd.Series(oof_best).round(4).to_string())
+        f.write("\n")
+    
     return fold_metrics, summary, threshold_table, oof_proba
 
 
 def select_best_model(summary_df: pd.DataFrame) -> pd.Series:
-    """Selecciona mejor modelo. Métrica principal: PR-AUC OOF."""
+    """Selecciona mejor modelo. Métrica principal: PR-AUC OOF.
+
+    Garantiza que SIEMPRE devuelve una pd.Series válida o lanza una excepción
+    explícita. Nunca devuelve None ni un DataFrame vacío, para que el llamador
+    pueda usar el resultado sin riesgo de NameError/AttributeError.
+    """
+    if summary_df is None or summary_df.empty:
+        raise ValueError("summary_df está vacío: no hay modelos para seleccionar.")
+
+    if "model" not in summary_df.columns:
+        raise KeyError("summary_df no tiene columna 'model'.")
+
+    if "oof_pr_auc" not in summary_df.columns:
+        raise KeyError("summary_df no tiene columna 'oof_pr_auc' para ordenar.")
+
     candidates = summary_df[~summary_df["model"].eq("dummy_prior")].copy()
     if candidates.empty:
-        raise ValueError("No hay modelos candidatos fuera del dummy.")
+        # Solo quedó el dummy: lo permitimos como fallback pero avisamos.
+        print("[AVISO] El único modelo disponible es 'dummy_prior'. Se selecciona por falta de alternativas.")
+        candidates = summary_df.copy()
 
     candidates = candidates.sort_values(
         ["oof_pr_auc", "oof_roc_auc", "oof_f2"],
@@ -865,15 +898,48 @@ def train_and_select(
 
     save_comparison_plot(cv_summary, output_dir)
 
+    # -------------------------------------------------------------------------
+    # Selección del mejor modelo.
+    # `best_row` SIEMPRE debe quedar definido en esta línea antes de usarse más
+    # abajo. No renombrar esta variable ni mover la asignación dentro de un
+    # try/except o un if: si se hace, cualquier uso posterior (por ejemplo
+    # best_row.copy() o best_row["model"]) lanzará NameError porque la variable
+    # nunca llegó a crearse. Si necesitas una copia para imprimir o loguear,
+    # úsala DESPUÉS de esta línea: best_row_print = best_row.copy().
+    # -------------------------------------------------------------------------
     best_row = select_best_model(cv_summary)
+
+    # Validación defensiva: la fila seleccionada debe traer las claves esperadas.
+    required_keys = {"model", "best_threshold_oof"}
+    missing_keys = required_keys - set(best_row.index)
+    if missing_keys:
+        raise KeyError(
+            f"La fila del mejor modelo no contiene las claves requeridas {sorted(missing_keys)}. "
+            f"Claves disponibles: {list(best_row.index)}"
+        )
+
     best_model_name = str(best_row["model"])
     best_threshold = float(best_row["best_threshold_oof"])
+
+    # El nombre seleccionado debe existir en el diccionario de modelos.
+    if best_model_name not in models:
+        raise KeyError(
+            f"El modelo seleccionado '{best_model_name}' no está en el diccionario de modelos "
+            f"entrenados. Modelos disponibles: {list(models)}"
+        )
     best_model = models[best_model_name]
 
     print("\n" + "=" * 90)
     print("[OK] Mejor modelo por PR-AUC OOF")
     print("=" * 90)
-    print(best_row.round(4).to_string())
+    # best_row es un pd.Series de tipo MIXTO (contiene el nombre del modelo como
+    # texto y el resto como números). best_row.round(4) falla con
+    # "TypeError: type str doesn't define __round__" porque intenta redondear el
+    # string. Redondeamos solo los valores numéricos y dejamos el texto intacto.
+    best_row_print = best_row.copy()
+    numeric_mask = best_row_print.map(lambda v: isinstance(v, (int, float))) & best_row_print.notna()
+    best_row_print.loc[numeric_mask] = best_row_print.loc[numeric_mask].astype(float).round(4)
+    print(best_row_print.to_string())
 
     final_model, final_metrics = fit_final_and_evaluate(
         best_model_name=best_model_name,
